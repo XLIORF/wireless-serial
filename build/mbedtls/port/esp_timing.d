@@ -1,0 +1,27 @@
+port/esp_timing.o: \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/port/esp_timing.c \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/port/include/mbedtls/esp_config.h \
+ /home/wlx/developWork/esp8266/wirelessSerial/build/include/sdkconfig.h \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/config.h \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/check_config.h \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/port/include/esp_mem.h \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/check_config.h \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/newlib/platform_include/sys/time.h \
+ /opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/timing.h
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/port/include/mbedtls/esp_config.h:
+
+/home/wlx/developWork/esp8266/wirelessSerial/build/include/sdkconfig.h:
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/config.h:
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/check_config.h:
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/port/include/esp_mem.h:
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/check_config.h:
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/newlib/platform_include/sys/time.h:
+
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/mbedtls/include/mbedtls/timing.h:
+/opt/espressif/esp8266-idea/ESP8266_RTOS_SDK/components/mbedtls/port/esp_timing.c:
