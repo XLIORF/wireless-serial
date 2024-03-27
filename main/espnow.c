@@ -134,7 +134,6 @@ esp_err_t espnow_send_package(void *buf, uint8_t len, bool is_broadcast)
     send_buf->crc = 0;
     send_buf->crc = crc16_le(UINT16_MAX, (uint8_t const *)send_buf, send_len); //解析时，应先把crc设置为0再计算；
     if(esp_now_send(is_broadcast == true?broadcast_mac:target_mac, (const uint8_t *)send_buf, send_len) != ESP_OK)
-    // if(esp_now_send(is_broadcast == true?broadcast_mac:target_mac, (const uint8_t *)"hello from espnow", 17) != ESP_OK)
     {
         ESP_LOGD(TAG, "发送失败！\n");
         free(send_buf);
@@ -153,7 +152,6 @@ void espnow_task(void *pvParameter)
             case ESPNOW_SEND_CB:
             {
                 espnow_event_send_cb_t * send_info = &evt.info.send_cb;
-                // is_broadcast = IS_BROADCAST_ADDR(send_info->mac_addr);
                 if(!is_peer)
                 {
                     vTaskDelay(500);
@@ -176,11 +174,12 @@ void espnow_task(void *pvParameter)
                     ESP_LOGI(TAG,"crc校验失败！");
                     break;
                 }
-                for(int i=0;i<recv_info->len;i++)
-                {
-                    printf("%c",recv_info->data[i]);
-                }
-                printf("\n");
+                //多重打印的错误
+                // for(int i=0;i<recv_info->len;i++)
+                // {
+                //     printf("%c",recv_info->data[i]);
+                // }
+                // printf("\n");
                 
                 if (!is_peer && esp_now_is_peer_exist(recv_info->mac_addr) == false) {
                     esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
@@ -196,7 +195,6 @@ void espnow_task(void *pvParameter)
                     memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
                     memcpy(peer->peer_addr, recv_info->mac_addr, ESP_NOW_ETH_ALEN);
                     ESP_ERROR_CHECK( esp_now_add_peer(peer) );
-                    is_peer = true;
                     ESP_LOGI(TAG,"已连接");
                     free(peer);
                     memcpy(target_mac, recv_info->mac_addr, ESP_NOW_ETH_ALEN);
@@ -205,17 +203,17 @@ void espnow_task(void *pvParameter)
                 if(data->type == ESPNOW_DATA_BROADCAST)
                 {
                     vTaskDelay(500);
-                    espnow_send_package("hello", 5, false);
+                    espnow_send_package("peer", 4, false);
                     ESP_LOGI(TAG,"Send to "MACSTR"",MAC2STR(recv_info->mac_addr));
                 }
                 else if(data->type == ESPNOW_DATA_UNICAST)
                 {
-                    uart_write_bytes(EX_UART_NUM, (const char *)data->payload, recv_info->len - sizeof(espnow_package_t));
-                    // printf("printf:\n");
-                    // for(int i=0;i<recv_info->len - sizeof(espnow_package_t);i++)
-                    //     printf("%c",(char )(data->payload[i]));
-                    // printf("\n");
-                    // ESP_LOGI(TAG, "recv :%s",data->payload);
+                    if(strncmp((const char *)data->payload, "peer", 4) != 0)
+                    {
+                        is_peer = true;
+                    }
+                    if(is_peer)
+                        uart_write_bytes(EX_UART_NUM, (const char *)data->payload, recv_info->len - sizeof(espnow_package_t));
                 }
                 else
                 {
@@ -235,10 +233,10 @@ void uart_rx_task(void *param)
 {
     uint8_t data[BUF_SIZE] = {0};
     memset(data, '\0', BUF_SIZE);
-    while (1) {
-        // Read data from the UART
+    while(!is_peer) vTaskDelay(500);
+    while (1) 
+    {
         int len = uart_read_bytes(EX_UART_NUM, data, BUF_SIZE, 20 / portTICK_RATE_MS);
-        // uart_write_bytes(EX_UART_NUM,(const char *) data,len);
         if(len > 0)
         {
             ESP_LOGI(TAG,"send :%s", (char *)data);
