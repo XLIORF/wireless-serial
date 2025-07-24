@@ -1,1 +1,10 @@
 build/
+.cache/
+.vscode/
+.vscode-test/
+compile_commands.json
+settings.json
+sdkconfig.old
+.vscode/settings.json
+sdkconfig.old
+.vscode/settings.json

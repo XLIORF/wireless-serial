@@ -1,3 +1,10 @@
 {
-    "idf.adapterTargetName": "esp8266"
+    "idf.adapterTargetName": "esp8266",
+    "files.associations": {
+        "array": "c",
+        "string_view": "c",
+        "initializer_list": "c",
+        "utility": "c",
+        "serial_espnow.h": "c"
+    }
 }

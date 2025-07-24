@@ -8,17 +8,19 @@
 #define ESPNOW_WIFI_IF   ESP_IF_WIFI_AP
 #endif
 
-#define ESPNOW_QUEUE_SIZE           6
+#define ESPNOW_QUEUE_SIZE           12
 
 #define IS_BROADCAST_ADDR(addr) (memcmp(addr, example_broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
 
 #define BUF_SIZE (1024)
+#define RX_BUF_SIZE (32)
 #define EX_UART_NUM UART_NUM_0
 
 typedef enum {
     ESPNOW_DATA_BROADCAST = 0,
     ESPNOW_DATA_UNICAST = 1,
-    ESPNOW_DATA_MAX = 2,
+    ESPNOW_DATA_ACK = 2,
+    ESPNOW_DATA_MAX = 3,
 } espnow_type_t;
 
 typedef struct {
@@ -56,7 +58,7 @@ typedef struct {
 
 esp_err_t espnow_send_package(void *, uint8_t , bool );
 void wifi_init(void);
-esp_err_t espnow_init(void);
+esp_err_t Serial_Espnow_init(void);
 void espnow_task(void *);
 void uart_rx_task(void *);
 #endif

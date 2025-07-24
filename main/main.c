@@ -15,17 +15,17 @@
 #include "rom/ets_sys.h"
 #include "rom/crc.h"
 #include "driver/uart.h"
-#include "espnow.h"
+#include "Serial_Espnow.h"
 
 
 void app_main()
 {
     ESP_ERROR_CHECK( nvs_flash_init() );
     wifi_init();
-    espnow_init();
-    uint8_t data[8] = {0x55};
+    Serial_Espnow_init();
+    // uint8_t data[8] = {0x55};
     xTaskCreate(espnow_task,"espnow_task",2048,NULL,4,NULL);
-    espnow_send_package(data, 8, true);
+    // espnow_send_package(data, 8, true);
 
     uart_config_t uart_config = {
         .baud_rate = 115200,
