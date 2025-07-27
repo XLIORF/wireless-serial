@@ -5,6 +5,10 @@
         "string_view": "c",
         "initializer_list": "c",
         "utility": "c",
-        "serial_espnow.h": "c"
+        "serial_espnow.h": "c",
+        "compare": "c",
+        "functional": "c",
+        "tuple": "c",
+        "type_traits": "c"
     }
 }

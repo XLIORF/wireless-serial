@@ -21,19 +21,20 @@
 #include "driver/uart.h"
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
-#define ACK_RETRY_MAX 3
+#include "esp_timer.h"
+
+#define PING_TIMEOUT_S 5
 static const char *TAG = "Serial_ESPNow";
 
 static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static uint8_t target_mac[ESP_NOW_ETH_ALEN] = {0xff};
 static xQueueHandle espnow_cb_queue;
 static bool is_peer = false;
-static RingbufHandle_t s2w_buf = NULL;
-static RingbufHandle_t w2s_buf = NULL;
-// 标志两个设备的连接状态和串口的工作状态
-// static EventGroupHandle_t con_status_group;
-// static const int CSEG_CONNECTED_BIT = BIT0;
-// static const int CSEG_SERIAL_RUN_BIT = BIT1;
+static esp_timer_handle_t con_heart_timer = 0;
+static uint32_t heart_time = 0;
+static uint32_t ping_time = 0;
+static uint32_t ack_time = 0;
+static bool wait_ack = false;
 
 /**
  * @brief ESP-NOW发送回调函数
@@ -55,6 +56,7 @@ static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status
         ESP_LOGE(TAG, "Send cb arg error");
         return;
     }
+    ping_time = 0; // 收到ACK包，重置ping计时器
 
     // 检查队列句柄有效性
     if (espnow_cb_queue == NULL)
@@ -130,6 +132,34 @@ esp_err_t espnow_send_ack()
     }
 
     send_buf->type = ESPNOW_DATA_ACK;
+    // 计算CRC校验值，计算前需将crc字段置0
+    send_buf->crc = 0;
+
+    // 通过ESP-NOW发送数据包
+    if (esp_now_send(target_mac, (const uint8_t *)send_buf, send_len) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "发送失败！\n");
+        free(send_buf);
+        return ESP_FAIL;
+    }
+
+    // 释放分配的内存
+    free(send_buf);
+    return ESP_OK;
+}
+
+esp_err_t espnow_send_ping()
+{
+    // 分配发送包内存   包格式：espnow_package_t + 数据 + 数据长度
+    uint8_t send_len = sizeof(espnow_package_t);
+    espnow_package_t *send_buf = (espnow_package_t *)malloc(send_len);
+    if (send_buf == NULL)
+    {
+        ESP_LOGD(TAG, "分配内存失败！\n");
+        return ESP_FAIL;
+    }
+
+    send_buf->type = ESPNOW_DATA_PING;
 
     // 计算CRC校验值，计算前需将crc字段置0
     send_buf->crc = 0;
@@ -180,6 +210,11 @@ esp_err_t espnow_send_package(void *buf, uint8_t len, bool is_broadcast)
     // 计算CRC校验值，计算前需将crc字段置0
     send_buf->crc = 0;
     send_buf->crc = crc16_le(UINT16_MAX, (uint8_t const *)send_buf, send_len); // 解析时，应先把crc设置为0再计算；
+    // 等待前一个对方接收数据包完成
+    while (is_peer && wait_ack)
+    {
+        vTaskDelay(100);
+    }
 
     // 通过ESP-NOW发送数据包
     if (esp_now_send(is_broadcast == true ? broadcast_mac : target_mac, (const uint8_t *)send_buf, send_len) != ESP_OK)
@@ -191,101 +226,160 @@ esp_err_t espnow_send_package(void *buf, uint8_t len, bool is_broadcast)
 
     // 释放分配的内存
     free(send_buf);
+
+    wait_ack = true;
+    ack_time = 0;
     return ESP_OK;
 }
 
 void espnow_task(void *pvParameter)
 {
     espnow_event_t evt;
-    // bool is_broadcast = true;
-    bool is_ack = true;
-    uint8_t nack_retry = 0;
-    while (xQueueReceive(espnow_cb_queue, &evt, portMAX_DELAY) == pdTRUE)
+    while (1)
     {
-        switch (evt.id)
+        // 数据包应答超时检查
+        if (is_peer && wait_ack && (ack_time >= PING_TIMEOUT_S + 1))
         {
-        case ESPNOW_SEND_CB:
-        {
-            // espnow_event_send_cb_t *info = &evt.info.send_cb;
-            if (!is_peer)
-            {
-                // vTaskDelay(500);
-                espnow_send_package("hello", 5, true);
-                // ESP_LOGI(TAG, "Send [hello] to " MACSTR "", MAC2STR(info->mac_addr));
-            }
-            break;
+            is_peer = false;
+            wait_ack = false;
+            ack_time = 0;
+            esp_timer_stop(con_heart_timer);
+            ESP_ERROR_CHECK(esp_now_del_peer(target_mac));
+            printf("未收到ACK，连接断开，尝试重连...\n");
+            espnow_send_package("hello", 5, true); // 发送广播消息，开始匹配
         }
-        case ESPNOW_RECV_CB:
+        // 保持本机在线
+        if (is_peer && (ping_time >= PING_TIMEOUT_S))
         {
-            // 取出数据包
-            espnow_event_recv_cb_t *info = &evt.info.recv_cb;
-            espnow_package_t *package = (espnow_package_t *)info->data;
-            if (package == NULL)
+            // 发送ping包
+            ESP_LOGD(TAG, "发送ping包");
+            espnow_send_ping();
+            ping_time = 0; // 重置ping计时器
+        }
+        // 对方是否在线检查
+        if (is_peer && (heart_time >= PING_TIMEOUT_S + 1))
+        {
+            // 心跳超时，断开连接
+            printf("连接断开, 重新连接...\n");
+            is_peer = false;
+            wait_ack = false;
+            esp_timer_stop(con_heart_timer);
+            ESP_ERROR_CHECK(esp_now_del_peer(target_mac));
+
+            vTaskDelay(1000);                      // 等待1秒后重试
+            espnow_send_package("hello", 5, true); // 发送广播消息，开始匹配
+            heart_time = 0;                        // 重置心跳计时器
+        }
+        // ESP-NOW事件处理
+        if (xQueueReceive(espnow_cb_queue, &evt, 500) == pdTRUE)
+        {
+            switch (evt.id)
             {
-                ESP_LOGE(TAG, "Recv package is null");
+            case ESPNOW_SEND_CB:
+            {
+                // espnow_event_send_cb_t *info = &evt.info.send_cb;
+                if (!is_peer)
+                {
+                    vTaskDelay(50);
+                    espnow_send_package("hello", 5, true);
+                    // ESP_LOGD(TAG, "Send [hello] to " MACSTR "", MAC2STR(info->mac_addr));
+                }
                 break;
             }
-            // 连接判断
-            if (!is_peer && esp_now_is_peer_exist(info->mac_addr) == false)
+            case ESPNOW_RECV_CB:
             {
-                esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-                if (peer == NULL)
+                // 取出数据包
+                espnow_event_recv_cb_t *info = &evt.info.recv_cb;
+                espnow_package_t *package = (espnow_package_t *)info->data;
+                if (package == NULL)
                 {
-                    ESP_LOGE(TAG, "Malloc peer information fail");
-                    vTaskDelete(NULL);
-                }
-                memset(peer, 0, sizeof(esp_now_peer_info_t));
-                peer->channel = CONFIG_ESPNOW_CHANNEL;
-                peer->ifidx = ESPNOW_WIFI_IF;
-                peer->encrypt = true;
-                memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
-                memcpy(peer->peer_addr, info->mac_addr, ESP_NOW_ETH_ALEN);
-                ESP_ERROR_CHECK(esp_now_add_peer(peer));
-                ESP_LOGI(TAG, "已连接");
-                is_peer = true;
-                free(peer);
-                memcpy(target_mac, info->mac_addr, ESP_NOW_ETH_ALEN);
-            }
-            else if (package->type == ESPNOW_DATA_ACK)
-            {
-                is_ack = true;
-                nack_retry = 0;
-                ESP_LOGI(TAG, "收到ACK包");
-            }
-            else if (package->type == ESPNOW_DATA_UNICAST)
-            {
-                // 校验数据
-                uint16_t crc_recv = package->crc;
-                uint16_t crc_cal = 0;
-                package->crc = 0;
-                crc_cal = crc16_le(UINT16_MAX, (uint8_t const *)package, info->len);
-                if (crc_cal != crc_recv)
-                {
-                    ESP_LOGE(TAG, "crc check error!");
+                    ESP_LOGE(TAG, "Recv package is null");
                     break;
                 }
-                // 解包
-                uint8_t *payload = package->payload + 1;
-                uint8_t len = package->payload[0];
-                ESP_LOGI(TAG, "recv from:" MACSTR " len: %d, 类型:%d, 内容：%.*s.", MAC2STR(info->mac_addr), info->len, package->type, len, payload);
-                if (is_peer)
+                // 连接判断
+                if (!is_peer && esp_now_is_peer_exist(info->mac_addr) == false)
                 {
-                    // TODO
-                    espnow_send_ack();
-                    if (xRingbufferSend(w2s_buf, payload, len, 0) != pdTRUE)
+                    // 如果是广播包，且未连接，则添加对方为peer
+                    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
+                    if (peer == NULL)
                     {
-                        ESP_LOGE(TAG, "Send to w2s_buf fail");
+                        ESP_LOGE(TAG, "Malloc peer information fail");
+                        vTaskDelete(NULL);
+                    }
+                    memset(peer, 0, sizeof(esp_now_peer_info_t));
+                    peer->channel = CONFIG_ESPNOW_CHANNEL;
+                    peer->ifidx = ESPNOW_WIFI_IF;
+                    peer->encrypt = true;
+                    memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
+                    memcpy(peer->peer_addr, info->mac_addr, ESP_NOW_ETH_ALEN);
+                    ESP_ERROR_CHECK(esp_now_add_peer(peer));
+                    printf("已连接。\r\n");
+                    free(peer);
+                    // 记录对方MAC地址
+                    memcpy(target_mac, info->mac_addr, ESP_NOW_ETH_ALEN);
+                    // 设置连接状态
+                    is_peer = true;
+                    // 设置心跳和ping时间
+                    heart_time = 0;
+                    ping_time = 0;
+                    ack_time = 0;
+                    wait_ack = false;
+                    esp_err_t err = esp_timer_start_periodic(con_heart_timer, 1000000);
+                    if (err != ESP_OK)
+                    {
+                        ESP_LOGE(TAG, "Failed to start con_heart_timer: %s", esp_err_to_name(err));
+                        vTaskDelete(NULL);
+                    }
+                    ESP_LOGD(TAG, "已启动心跳定时器");
+                }
+                else if (package->type == ESPNOW_DATA_ACK)
+                {
+                    heart_time = 0; // 收到ACK包，重置心跳计时器
+                    ack_time = 0;
+                    wait_ack = false; // 收到ACK包，重置等待ACK状态
+                    ESP_LOGD(TAG, "收到ACK包");
+                }
+                else if (package->type == ESPNOW_DATA_UNICAST)
+                {
+                    heart_time = 0; // 收到ACK包，重置心跳计时器
+                    // 校验数据
+                    uint16_t crc_recv = package->crc;
+                    uint16_t crc_cal = 0;
+                    package->crc = 0;
+                    crc_cal = crc16_le(UINT16_MAX, (uint8_t const *)package, info->len);
+                    if (crc_cal != crc_recv)
+                    {
+                        ESP_LOGE(TAG, "crc check error!");
+                        break;
+                    }
+                    // 解包
+                    uint8_t *payload = package->payload + 1;
+                    uint8_t len = package->payload[0];
+                    ESP_LOGD(TAG, "recv from:" MACSTR " len: %d, 类型:%d, 内容：%.*s.", MAC2STR(info->mac_addr), info->len, package->type, len, payload);
+                    if (is_peer)
+                    {
+                        uart_write_bytes(EX_UART_NUM, (const char *)payload, len);
+                        // ? 发送会影响payload中的数据，原因未知
+                        espnow_send_ack();
+                        ESP_LOGD(TAG, "send [esp_now->serial]:%.*s", len, payload);
                     }
                 }
+                else if (package->type == ESPNOW_DATA_PING)
+                {
+                    heart_time = 0; // 收到ping包，重置心跳计时器
+                    ESP_LOGD(TAG, "收到ping包");
+                }
+                else
+                {
+                    heart_time = 0; // 收到ping包，重置心跳计时器
+                    ESP_LOGD(TAG, "收到其他包");
+                }
+                break;
             }
-            else
-            {
+            default:
+                ESP_LOGE(TAG, "Callback type error: %d", evt.id);
+                break;
             }
-            break;
-        }
-        default:
-            ESP_LOGE(TAG, "Callback type error: %d", evt.id);
-            break;
         }
     }
 }
@@ -296,6 +390,7 @@ void uart_rx_task(void *param)
     size_t rx_len = 0;
     while (1)
     {
+        vTaskDelay(5);
         // 判断用户是否输入
         esp_err_t err = uart_get_buffered_data_len(EX_UART_NUM, &rx_len);
         if (err != ESP_OK)
@@ -318,55 +413,18 @@ void uart_rx_task(void *param)
         if (len > 0)
         {
             ESP_LOGD(TAG, "send [serial->esp_now]:%s", (char *)data);
-            if (xRingbufferSend(s2w_buf, data, len, 0) != pdTRUE)
-            {
-                ESP_LOGE(TAG, "Send to s2w_buf fail");
-            }
+            espnow_send_package(data, len, false); // 发送数据包
         }
     }
 }
 
-void send_task(void *param)
+void con_heart_timer_callback(void *arg)
 {
-    size_t item_size;
-    char *item;
-    while (1)
-    {
-        if (!is_peer)
-        {
-            vTaskDelay(1000);
-            continue;
-        }
-
-        item = (char *)xRingbufferReceiveUpTo(w2s_buf, &item_size, 0, BUF_SIZE);
-        // Check received data
-        if (item != NULL)
-        {
-            uart_write_bytes(EX_UART_NUM, item, item_size);
-            // Return Item
-            vRingbufferReturnItem(w2s_buf, (void *)item);
-        }
-        else
-        {
-            // Failed to receive item
-            printf("Failed to receive1 item\n");
-        }
-        item = (char *)xRingbufferReceiveUpTo(s2w_buf, &item_size, 0, BUF_SIZE);
-        // Check received data
-        if (item != NULL)
-        {
-            espnow_send_package(item, item_size, false);
-            // Return Item
-            vRingbufferReturnItem(s2w_buf, (void *)item);
-        }
-        else
-        {
-            // Failed to receive item
-            printf("Failed to receive2 item\n");
-        }
-    }
+    heart_time++;
+    ping_time++;
+    if (wait_ack)
+        ack_time++;
 }
-
 /**
  * @brief 初始化WiFi模块
  *
@@ -428,14 +486,6 @@ esp_err_t Serial_Espnow_init(void)
         ESP_LOGE(TAG, "Create queue fail");
         return ESP_FAIL;
     }
-    s2w_buf = xRingbufferCreate(BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
-    w2s_buf = xRingbufferCreate(BUF_SIZE, RINGBUF_TYPE_BYTEBUF);
-    if (s2w_buf == NULL || w2s_buf == NULL)
-    {
-        ESP_LOGE(TAG, "Create ringbuffer fail"); 
-        vQueueDelete(espnow_cb_queue);
-        return ESP_FAIL;
-    }
 
     // Initialize ESP-NOW and register send and receive callback functions
     ESP_ERROR_CHECK(esp_now_init());
@@ -449,10 +499,10 @@ esp_err_t Serial_Espnow_init(void)
     if (peer == NULL)
     {
         ESP_LOGE(TAG, "Malloc peer information fail");
-        ESP_LOGE(TAG, "Malloc peer information fail");
         vQueueDelete(espnow_cb_queue);
         esp_now_deinit();
         return ESP_FAIL;
+    }
     memset(peer, 0, sizeof(esp_now_peer_info_t));
     peer->channel = CONFIG_ESPNOW_CHANNEL;
     peer->ifidx = ESPNOW_WIFI_IF;
@@ -460,9 +510,28 @@ esp_err_t Serial_Espnow_init(void)
     memcpy(peer->peer_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
     ESP_ERROR_CHECK(esp_now_add_peer(peer));
     free(peer);
+
     uint32_t esp_now_version;
     esp_now_get_version(&esp_now_version);
     ESP_LOGI(TAG, "ESP-NOW Version: %d", esp_now_version);
-    xTaskCreate(send_task, "send_task", 4096, NULL, 5, NULL);
+
+    // 初始化心跳定时器
+    esp_timer_init();
+    esp_timer_create_args_t con_heart_timer_args = {
+        .callback = &con_heart_timer_callback,
+        .arg = NULL,
+        .name = "espnow_con_heart_timer",
+        .dispatch_method = ESP_TIMER_TASK,
+    };
+    esp_err_t ret = esp_timer_create(&con_heart_timer_args, &con_heart_timer);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to create ack timer: %s", esp_err_to_name(ret));
+        vQueueDelete(espnow_cb_queue);
+        esp_now_deinit();
+        return ret;
+    }
+
+    esp_log_level_set("*", ESP_LOG_ERROR);
     return ESP_OK;
 }
