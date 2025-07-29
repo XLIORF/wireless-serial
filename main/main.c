@@ -23,7 +23,6 @@ void app_main()
     ESP_ERROR_CHECK( nvs_flash_init() );
     wifi_init();
     Serial_Espnow_init();
-    xTaskCreate(espnow_task,"espnow_task",2048,NULL,4,NULL);
     
 
     uart_config_t uart_config = {
@@ -36,6 +35,4 @@ void app_main()
     uart_param_config(EX_UART_NUM, &uart_config);
     uart_driver_install(EX_UART_NUM, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
     xTaskCreate(uart_rx_task,"uart_rx_task",2048,NULL,4,NULL);
-
-    espnow_send_package("hello", 5, true); // 发送广播消息，开始匹配
 }

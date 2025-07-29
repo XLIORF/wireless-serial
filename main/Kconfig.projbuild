@@ -52,4 +52,31 @@ config ESPNOW_SEND_LEN
     help
         Length of ESPNOW data to be sent, unit: byte.
 
+config CONNECT_INTERVAL
+    int "连接包发送间隔(ms)"
+    range 1000 3000
+    default 500
+
+
+config BROADCAST_INTERVAL
+    int "广播包发送间隔(ms)"
+    range 1000 3000
+    default 500
+
+
+config HEARTBEAT_INTERVAL
+    int "心跳包发送间隔(ms)"
+    range 3000 10000
+    default 3000
+
+
+config WLCON_MANAGER_PRORITY
+    int "无线连接管理进程优先级"
+    range 1 16
+    default 4
+
+config PRORITY_ESPNOW_SNED
+    int "ESPNOW发包任务的优先级"
+    range 1 16
+    default 4
 endmenu
