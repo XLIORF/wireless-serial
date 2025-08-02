@@ -23,6 +23,7 @@
 #include "driver/uart.h"
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
+#include "esp_timer.h"
 
 #define WIRELESS_PACKET_VERSION 1U
 static const char *TAG = "Serial_ESPNow";
@@ -44,6 +45,18 @@ static xQueueHandle espnow_cb_queue;
 static xQueueHandle wireless_recv_queue;
 // 主机决定码
 uint8_t master_ruling_code;
+// 心跳定时器
+static esp_timer_handle_t heartbeat_timer = NULL;
+// 心跳时间间隔
+static uint32_t heartbeat_time = 0;
+// 心跳发送间隔，防止心跳包发送过快
+static uint32_t heartbeat_interval = 0;
+// 任务优先级
+static int espnow_send_task_proiority = CONFIG_PRORITY_ESPNOW_SNED;
+static int wireless_manager_task_proiority = CONFIG_WLCON_MANAGER_PRORITY;
+// 任务句柄
+static TaskHandle_t espnow_send_task_handle = NULL;
+static TaskHandle_t wireless_manager_task_handle = NULL;
 /**
  * @brief ESP-NOW发送回调函数
  *
@@ -123,7 +136,7 @@ static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len
     {
         ESP_LOGW(TAG, "Func[espnow_recv_cb] Send queue fail");
     }
-    free(recv_cb->data);
+    // free(recv_cb->data);
 }
 
 // 封装数据包发送函数
@@ -201,13 +214,13 @@ static bool send_heartbeat_packet(int type)
     packet->version = WIRELESS_PACKET_VERSION;
     packet->crc = 0;
     packet->payload[0] = type;
-    packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
+    // packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
     espnow_packet_t espnow_packet = {
         .len = p_len,
         .data = (uint8_t *)packet,
         .mac = broadcast_mac,
     };
-    if (xQueueSend(espnow_send_queue, &espnow_packet, pdMS_TO_TICKS(10)) != pdTRUE)
+    if (xQueueSend(espnow_send_priority_queue, &espnow_packet, pdMS_TO_TICKS(10)) != pdTRUE)
     {
         ESP_LOGE(TAG, "Send broadcast packet to espnow_send_queue fail!");
         free(packet);
@@ -255,37 +268,74 @@ static bool send_ack_packet()
     crc_calc == crc_recv;                                                                                   \
 })
 
+// 有高优先级的数据包需要发送时，提高发送任务的优先级
+static void elevate_send_priority()
+{
+    // 获取优先队列的长度
+    BaseType_t queue_length = uxQueueMessagesWaiting(espnow_send_priority_queue);
+    // 如果优先队列中有数据，则提升发送任务的优先级
+    if (queue_length > 0 && espnow_send_task_handle != NULL)
+    {
+        // 提升发送任务的优先级
+        vTaskPrioritySet(espnow_send_task_handle, CONFIG_PRORITY_ESPNOW_SNED + 3);
+        vTaskDelay(pdMS_TO_TICKS(100)); // 确保任务调度器有时间处理优先级变更
+    }
+    // 如果发送任务的优先级低于配置的优先级，则提升其优先级
+    else if (espnow_send_task_handle != NULL)
+    {
+        BaseType_t current_priority = uxTaskPriorityGet(espnow_send_task_handle);
+        if (current_priority != CONFIG_PRORITY_ESPNOW_SNED)
+        {
+            vTaskPrioritySet(espnow_send_task_handle, CONFIG_PRORITY_ESPNOW_SNED);
+        }
+    }
+    // 如果发送队列中的数量超过配置最大值的三分之二，则提升优先级
+    BaseType_t send_queue_length = uxQueueMessagesWaiting(espnow_send_queue);
+    if (espnow_send_task_handle != NULL && send_queue_length > (ESPNOW_SEND_QUEUE_SIZE * 2 / 3))
+    {
+        BaseType_t current_priority = uxTaskPriorityGet(espnow_send_task_handle);
+        if (current_priority < CONFIG_PRORITY_ESPNOW_SNED + 3)
+        {
+            vTaskPrioritySet(espnow_send_task_handle, CONFIG_PRORITY_ESPNOW_SNED + 3);
+        }
+    }
+}
+
 void wireless_con_manager_task(void *pvParameters)
 {
     int retry_count = 0;
-    uint32_t last_heartbeat_time = xTaskGetTickCount();
-    uint32_t last_broadcast_time = xTaskGetTickCount();
-    uint32_t last_connect_rst_time = xTaskGetTickCount();
+    uint32_t last_broadcast_time = 0;
+    uint32_t last_connect_rst_time = 0;
     uint8_t connect_code = 0;
-    uint32_t last_heartbeat_interval;
     espnow_event_t evt;
+    esp_timer_start_periodic(heartbeat_timer, 1000 * 10); // 设置心跳间隔为配置的心跳间隔
     while (1)
     {
+        elevate_send_priority();
         if (status == WIRELESS_STATUS_CONNECTED)
         {
-            // 连接保持
-            last_heartbeat_interval = xTaskGetTickCount() - last_heartbeat_time;
-            if (last_heartbeat_interval > pdMS_TO_TICKS(CONFIG_HEARTBEAT_INTERVAL + 1500))
+            printf("距离上次心跳已过去%dms\n", heartbeat_time);
+            if (heartbeat_time > (CONFIG_HEARTBEAT_INTERVAL + 2000))
             {
                 // 心跳超时, 连接断开
-                ESP_LOGI(TAG, "心跳超时, 连接断开");
+                printf("心跳超时, 连接断开\n");
+                printf("heartbeat_time: %d ms, %d ms\n", heartbeat_time, (CONFIG_HEARTBEAT_INTERVAL + 1500));
                 status = WIRELESS_STATUS_DISCONNECTED;
             }
-            if (is_master && last_heartbeat_interval > pdMS_TO_TICKS(CONFIG_HEARTBEAT_INTERVAL))
+            else if (is_master && heartbeat_time > (CONFIG_HEARTBEAT_INTERVAL / 2))
             {
                 // 发送心跳包
-                ESP_LOGI(TAG, "发送心跳包");
-                send_heartbeat_packet(1);
+                if (heartbeat_interval > (CONFIG_HEARTBEAT_INTERVAL / 2))
+                {
+                    heartbeat_interval = 0; // 重置心跳发送间隔
+                    send_heartbeat_packet(1);
+                }
             }
         }
         else if (status == WIRELESS_STATUS_DISCONNECTED)
         {
             // TODO 清理数据，再次广播
+            printf("设备掉线\n");
             retry_count = 0;
             is_master = false;
             status = WIRELESS_STATUS_BROADCAST;
@@ -301,11 +351,12 @@ void wireless_con_manager_task(void *pvParameters)
             }
         }
         // 回调处理
-        if (xQueueReceive(espnow_cb_queue, &evt, pdMS_TO_TICKS(10)) == pdTRUE)
+        if (xQueueReceive(espnow_cb_queue, &evt, pdMS_TO_TICKS(1)) == pdTRUE)
         {
             // 收到数据包
             if (evt.id == ESPNOW_RECV_CB)
             {
+                ESP_LOGD(TAG, "收到数据包，类型: %u", ((wireless_packet_t *)(evt.info.recv_cb.data))->type);
                 // 有效检测
                 wireless_packet_t *packet = (wireless_packet_t *)evt.info.recv_cb.data;
                 if (sizeof(wireless_packet_t) > evt.info.recv_cb.len || packet == NULL)
@@ -320,11 +371,21 @@ void wireless_con_manager_task(void *pvParameters)
                     ESP_LOGW(TAG, "不支持的无线数据包版本！");
                     continue;
                 }
+                if (status != WIRELESS_STATUS_CONNECTED && !(packet->type == WIRELESS_PACKET_TYPE_BROADCAST || packet->type == WIRELESS_PACKET_TYPE_CONNECT))
+                {
+                    ESP_LOGD(TAG, "未连接状态下收到非广播包，丢弃数据包");
+                    continue;
+                }
                 // 数据包分类处理
                 switch (packet->type)
                 {
                 case WIRELESS_PACKET_TYPE_BROADCAST:
                 {
+                    if (status != WIRELESS_STATUS_BROADCAST && status != WIRELESS_STATUS_CONNECT_RST)
+                    {
+                        ESP_LOGD(TAG, "收到广播包，但当前状态不是广播状态，丢弃数据包");
+                        break;
+                    }
                     if (retry_count >= 3)
                     {
                         // 连接失败, 继续广播
@@ -332,8 +393,7 @@ void wireless_con_manager_task(void *pvParameters)
                         retry_count = 0;
                         is_master = false;
                     }
-                    // 若在无连接的状态，则添加连接请求包到发送队列中，否则丢弃
-                    else if ((status == WIRELESS_STATUS_BROADCAST || status == WIRELESS_STATUS_CONNECT_RST) && master_ruling_code > packet->payload[0])
+                    else if (master_ruling_code > packet->payload[0])
                     {
                         printf("作为主机端\n");
                         is_master = true;
@@ -363,12 +423,10 @@ void wireless_con_manager_task(void *pvParameters)
                         {
                             continue;
                         }
-                        printf("发送连接请求\n");
-                        // 添加连接请求包到发送队列中
 
                         connect_code = esp_random() & 0xff;
                         send_connect_packet(1, connect_code);
-                        ESP_LOGI(TAG, "发送连接请求包，连接码: %d", connect_code);
+                        ESP_LOGD(TAG, "发送连接请求包，连接码: %d", connect_code);
                         last_connect_rst_time = xTaskGetTickCount();
                         retry_count++;
                     }
@@ -376,6 +434,10 @@ void wireless_con_manager_task(void *pvParameters)
                 }
                 case WIRELESS_PACKET_TYPE_CONNECT:
                 {
+                    if (status == WIRELESS_STATUS_CONNECTED)
+                    {
+                        break; // 如果已经在连接状态，则忽略连接请求包
+                    }
                     if (esp_now_is_peer_exist(evt.info.recv_cb.mac_addr) == false)
                     {
                         // 如果是广播包，且未连接，则添加对方为peer
@@ -407,19 +469,19 @@ void wireless_con_manager_task(void *pvParameters)
                     {
                         connect_code = packet->payload[1];
                         send_connect_packet(2, connect_code + 1);
-                        ESP_LOGI(TAG, "收到连接请求包，返回连接码: %d", connect_code);
+                        ESP_LOGD(TAG, "收到连接请求包，返回连接码: %d", connect_code);
                     }
                     else if (packet->payload[0] == 0x02) // 应答包
                     {
                         // 验证连接校验码
-                        ESP_LOGI(TAG, "收到连接请求应答包，连接码: %d", packet->payload[1]);
+                        ESP_LOGD(TAG, "收到连接请求应答包，连接码: %d", packet->payload[1]);
                         if (packet->payload[1] == connect_code + 1)
                         {
                             send_connect_packet(3, packet->payload[1] + 1);
                             // 进入连接状态
                             is_master = true;
                             printf("连接建立成功\n");
-                            last_heartbeat_interval = xTaskGetTickCount();
+                            heartbeat_time = 0;
                             status = WIRELESS_STATUS_CONNECTED;
                         }
                         else
@@ -430,13 +492,13 @@ void wireless_con_manager_task(void *pvParameters)
                     }
                     else if (packet->payload[0] == 0x03) // 连接建立包
                     {
-                        ESP_LOGI(TAG, "收到连接建立包，连接码: %d", packet->payload[1]);
+                        ESP_LOGD(TAG, "收到连接建立包，连接码: %d", packet->payload[1]);
                         if (packet->payload[1] == connect_code + 2)
                         {
                             // 进入连接状态
                             is_master = false;
                             status = WIRELESS_STATUS_CONNECTED;
-                            last_heartbeat_interval = xTaskGetTickCount();
+                            heartbeat_time = 0;
                             printf("连接建立成功\n");
                         }
                         else
@@ -449,24 +511,20 @@ void wireless_con_manager_task(void *pvParameters)
                 }
                 case WIRELESS_PACKET_TYPE_HEARTBEAT: // 心跳包
                 {
-                    ESP_LOGI(TAG, "收到心跳包，类型: %d", packet->payload[0]);
-                    // crc 校验
-                    if (CRC_CHECK(packet) == false)
-                    {
-                        ESP_LOGW(TAG, "crc check failed!");
-                        continue;
-                    }
+                    heartbeat_time = 0;
+                    ESP_LOGD(TAG, "收到心跳包，类型: %d", packet->payload[0]);
+                    // if (CRC_CHECK(packet) == false)
+                    // {
+                    //     ESP_LOGW(TAG, "crc check failed!");
+                    //     break;
+                    // }
                     if (packet->payload[0] == 0x01) // 请求包
                     {
-                        // 刷新心跳时间
-                        last_heartbeat_time = xTaskGetTickCount();
-                        // 回复心跳应答包
                         send_heartbeat_packet(2);
                     }
                     else if (packet->payload[0] == 0x02) // 应答包
                     {
-                        // 刷新心跳时间
-                        last_heartbeat_time = xTaskGetTickCount();
+                        // heartbeat_time = 0;
                     }
                     break;
                 }
@@ -475,11 +533,10 @@ void wireless_con_manager_task(void *pvParameters)
                     // crc  校验
                     if (CRC_CHECK(packet) == false)
                     {
-                        ESP_LOGW(TAG, "crc check failed!");
-                        continue;
+                        ESP_LOGD(TAG, "crc check failed!");
+                        break;
                     }
-                    // 刷新心跳时间
-                    last_heartbeat_time = xTaskGetTickCount();
+                    heartbeat_time = 0;
 
                     // 丢进输出队列中
                     buf_len_t espnow_serial = {
@@ -492,36 +549,33 @@ void wireless_con_manager_task(void *pvParameters)
                     if (xQueueSend(wireless_recv_queue, &espnow_serial, pdMS_TO_TICKS(10)) != pdTRUE)
                     {
                         ESP_LOGE(TAG, "输出数据到串口队列失败");
-                        continue;
+                        break;
                     }
                     break;
                 }
                 case WIRELESS_PACKET_TYPE_DATA_ACK:
                 {
-                    ESP_LOGI(TAG, "收到数据包应答");
+                    ESP_LOGD(TAG, "收到数据包应答");
                     // TODO 数据发送成功，从队列中移除
                     wait_ack = false;
-                    //  刷新心跳时间
-                    last_heartbeat_time = xTaskGetTickCount();
+                    heartbeat_time = 0;
                     break;
                 }
                 default:
                 {
-                    // ERROR
                     ESP_LOGW(TAG, "未知数据包类型！");
                 }
                 }
-                // free(packet);
+                free(packet);
             }
             else if (evt.id == ESPNOW_SEND_CB)
             {
             }
             else
             {
-                // ERR
+                ESP_LOGE(TAG, "错误的回调类型！");
             }
         }
-        // vTaskDelay(100/portTICK_PERIOD_MS);
     }
 }
 
@@ -532,12 +586,12 @@ void esp_now_task(void *pvParameters)
     while (1)
     {
         // 短的超时时间应该可以避免单个队列长时间阻塞和防止狗叫
-        if (xQueueReceive(espnow_send_priority_queue, &esp_now_data, pdMS_TO_TICKS(10)) == pdTRUE)
+        if (xQueueReceive(espnow_send_priority_queue, &esp_now_data, pdMS_TO_TICKS(1)) == pdTRUE)
         {
             esp_now_send(esp_now_data.mac, esp_now_data.data, esp_now_data.len);
             free(esp_now_data.data);
         }
-        else if (xQueueReceive(espnow_send_queue, &esp_now_data, pdMS_TO_TICKS(10)) == pdTRUE)
+        if (xQueueReceive(espnow_send_queue, &esp_now_data, pdMS_TO_TICKS(1)) == pdTRUE)
         {
             if (!wait_ack)
             {
@@ -545,6 +599,7 @@ void esp_now_task(void *pvParameters)
                 free(esp_now_data.data);
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -615,6 +670,12 @@ void uart_rx_task(void *param)
     }
 }
 
+void wireless_heartbeat_handler(void *pvParameters)
+{
+    heartbeat_time += 10;
+    heartbeat_interval += 10;
+}
+
 void wifi_init(void)
 {
     static bool initialized = false;
@@ -671,6 +732,21 @@ esp_err_t Serial_Espnow_init(void)
     ESP_ERROR_CHECK(esp_now_add_peer(peer));
     free(peer);
 
+    // 创建心跳定时器
+    esp_timer_init();
+    esp_timer_create_args_t timer_args = {
+        .callback = &wireless_heartbeat_handler, // 心跳定时器回调函数
+        .name = "heartbeat_timer",
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+    };
+    // esp_timer_handle_t heartbeat_timer;
+    esp_err_t ret = esp_timer_create(&timer_args, &heartbeat_timer);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Create heartbeat timer fail: %s", esp_err_to_name(ret));
+        return ret;
+    }
     // 获取ESP_NOW版本
     uint32_t esp_now_version;
     esp_now_get_version(&esp_now_version);
@@ -678,8 +754,8 @@ esp_err_t Serial_Espnow_init(void)
 
     master_ruling_code = esp_random() & 0xff;
 
-    xTaskCreate(wireless_con_manager_task, "wireless_con_manager_task", 2048, NULL, CONFIG_WLCON_MANAGER_PRORITY, NULL);
-    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, CONFIG_PRORITY_ESPNOW_SNED, NULL);
+    xTaskCreate(wireless_con_manager_task, "wireless_con_manager_task", 2048, NULL, wireless_manager_task_proiority, &wireless_manager_task_handle);
+    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, espnow_send_task_proiority, &espnow_send_task_handle);
 
     // 开始广播
     send_broadcast_packet();
