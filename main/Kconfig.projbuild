@@ -87,7 +87,7 @@ config UART_BUF_SIZE
 
 config WLCON_IO_QUEUE_SIZE
     int "无线IO队列长度"
-    default 8
+    default 128
     help
         串口与无线传输函数之间的队列长度
 

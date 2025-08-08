@@ -386,8 +386,6 @@ void wlcon_con_manager(void *pvParameters)
             if (heartbeat_time > (CONFIG_HEARTBEAT_INTERVAL + 1000))
             {
                 // 心跳超时, 连接断开
-                printf("心跳超时, 连接断开\n");
-                printf("heartbeat_time: %d ms, %d ms\n", heartbeat_time, (CONFIG_HEARTBEAT_INTERVAL + 1500));
                 status = WIRELESS_STATUS_DISCONNECTED;
             }
 
@@ -707,6 +705,6 @@ esp_err_t wlcon_init(void)
 
     xTaskCreate(wlcon_con_manager, "wlcon_con_manager", 2048, NULL, wlcon_manager_priority, &wlcon_manager_handle);
     // 开始广播
-    printf("Broadcast...\n");
+    printf("Broadcast.\n");
     return ESP_OK;
 }
