@@ -55,13 +55,13 @@ config ESPNOW_SEND_LEN
 config CONNECT_INTERVAL
     int "连接包发送间隔(ms)"
     range 100 3000
-    default 800
+    default 1000
 
 
 config BROADCAST_INTERVAL
     int "广播包发送间隔(ms)"
     range 1000 3000
-    default 500
+    default 1000
 
 
 config HEARTBEAT_INTERVAL

@@ -5,6 +5,7 @@
 #include <time.h>
 #include <string.h>
 #include <assert.h>
+#include "esp_crc.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -27,6 +28,10 @@
 #include "esp_timer.h"
 
 #define WIRELESS_PACKET_VERSION 1U
+#define CON_TYPE_RST 0x01
+#define CON_TYPE_ACK 0x02
+#define CON_TYPE_EST 0x03
+
 static const char *TAG = "Serial_ESPNow";
 
 static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -54,6 +59,102 @@ static uint32_t heartbeat_interval = 0;
 static int wireless_manager_task_proiority = CONFIG_WLCON_MANAGER_PRORITY;
 // 任务句柄
 static TaskHandle_t wireless_manager_task_handle = NULL;
+
+// 静态分配数据包，避免重复的IO操作
+static wireless_packet_t *broadcast_packet, *connect_rst_packet, *connect_ack_packet, *connect_establish_packet, *heartbeat_packet, *heartbeat_ack_packet, *data_ack_packet;
+
+static size_t bp_len = sizeof(wireless_packet_t) + 1;
+static size_t crp_len = sizeof(wireless_packet_t) + 2;
+static size_t cap_len = sizeof(wireless_packet_t) + 2;
+static size_t cep_len = sizeof(wireless_packet_t) + 2;
+static size_t hp_len = sizeof(wireless_packet_t);
+static size_t hap_len = sizeof(wireless_packet_t);
+static size_t dap_len = sizeof(wireless_packet_t);
+
+#define free_p(p)        \
+    if (p != NULL)       \
+    {                    \
+        free((void *)p); \
+        p = NULL;        \
+    }
+
+void destroy_packet()
+{
+    free_p(broadcast_packet);
+    free_p(connect_rst_packet);
+    free_p(connect_ack_packet);
+    free_p(connect_establish_packet);
+    free_p(heartbeat_packet);
+    free_p(heartbeat_ack_packet);
+    free_p(data_ack_packet);
+}
+
+bool create_packet()
+{
+    // 广播包
+    broadcast_packet = malloc(bp_len);
+    connect_rst_packet = malloc(crp_len);
+    connect_ack_packet = malloc(cap_len);
+    connect_establish_packet = malloc(cep_len);
+    heartbeat_packet = malloc(hp_len);
+    heartbeat_ack_packet = malloc(hap_len);
+    data_ack_packet = malloc(dap_len);
+    if (broadcast_packet == NULL || connect_rst_packet == NULL || connect_ack_packet == NULL || connect_establish_packet == NULL || heartbeat_packet == NULL || heartbeat_ack_packet == NULL || data_ack_packet == NULL)
+    {
+        ESP_LOGE(TAG, "Malloc packet fail");
+        destroy_packet();
+        return false;
+    }
+    broadcast_packet->type = WIRELESS_PACKET_TYPE_BROADCAST;
+    broadcast_packet->length = 1;
+    broadcast_packet->version = WIRELESS_PACKET_VERSION;
+    broadcast_packet->crc = 0;
+    broadcast_packet->payload[0] = master_ruling_code;
+    broadcast_packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)broadcast_packet, sizeof(wireless_packet_t) + 1);
+    // 连接包
+    connect_rst_packet->type = WIRELESS_PACKET_TYPE_CONNECT;
+    connect_rst_packet->length = 2;
+    connect_rst_packet->version = WIRELESS_PACKET_VERSION;
+    connect_rst_packet->crc = 0;
+    connect_rst_packet->payload[0] = 1;
+    connect_rst_packet->payload[1] = 0;
+    connect_rst_packet->crc = 0;
+
+    connect_ack_packet->type = WIRELESS_PACKET_TYPE_CONNECT;
+    connect_ack_packet->length = 2;
+    connect_ack_packet->version = WIRELESS_PACKET_VERSION;
+    connect_ack_packet->crc = 0;
+    connect_ack_packet->payload[0] = 2;
+    connect_ack_packet->payload[1] = 0;
+    connect_ack_packet->crc = 0;
+
+    connect_establish_packet->type = WIRELESS_PACKET_TYPE_CONNECT;
+    connect_establish_packet->length = 2;
+    connect_establish_packet->version = WIRELESS_PACKET_VERSION;
+    connect_establish_packet->crc = 0;
+    connect_establish_packet->payload[0] = 3;
+    connect_establish_packet->payload[1] = 0;
+    connect_establish_packet->crc = 0;
+
+    heartbeat_packet->type = WIRELESS_PACKET_TYPE_DATA;
+    heartbeat_packet->length = 0;
+    heartbeat_packet->version = WIRELESS_PACKET_VERSION;
+    heartbeat_packet->crc = 0;
+    heartbeat_packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)heartbeat_packet, hp_len);
+
+    heartbeat_ack_packet->type = WIRELESS_PACKET_TYPE_DATA_ACK;
+    heartbeat_ack_packet->length = 0;
+    heartbeat_ack_packet->version = WIRELESS_PACKET_VERSION;
+    heartbeat_ack_packet->crc = 0;
+    heartbeat_ack_packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)heartbeat_ack_packet, hap_len);
+
+    data_ack_packet->type = WIRELESS_PACKET_TYPE_DATA_ACK;
+    data_ack_packet->length = 0;
+    data_ack_packet->version = WIRELESS_PACKET_VERSION;
+    data_ack_packet->crc = 0;
+    data_ack_packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)data_ack_packet, dap_len);
+    return true;
+}
 
 /**
  * @brief ESP-NOW发送回调函数
@@ -132,7 +233,6 @@ static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len
     recv_cb->len = len;
     memcpy(recv_cb->data, data, len);
     memcpy(recv_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-    ESP_LOGI(TAG, "队列剩余空间: %d", uxQueueSpacesAvailable(espnow_cb_queue));
     /* 将接收事件发送到队列中 */
     if (xQueueSend(espnow_cb_queue, &evt, pdMS_TO_TICKS(10)) != pdTRUE)
     {
@@ -142,98 +242,139 @@ static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len
 }
 
 // 封装数据包发送函数
-static bool send_broadcast_packet()
+static inline bool send_broadcast_packet()
 {
-    size_t p_len = sizeof(wireless_packet_t) + 1;
-    wireless_packet_t *packet = malloc(p_len);
-    if (packet == NULL)
-    {
-        ESP_LOGE(TAG, "Malloc packet fail");
-        return false;
-    }
-    packet->type = WIRELESS_PACKET_TYPE_BROADCAST;
-    packet->length = 1;
-    packet->version = WIRELESS_PACKET_VERSION;
-    packet->crc = 0;
-    packet->payload[0] = master_ruling_code;
-    packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, sizeof(wireless_packet_t) + 1);
+    // size_t p_len = sizeof(wireless_packet_t) + 1;
+    // wireless_packet_t *packet = malloc(p_len);
+    // if (packet == NULL)
+    // {
+    //     ESP_LOGE(TAG, "Malloc packet fail");
+    //     return false;
+    // }
+    // packet->type = WIRELESS_PACKET_TYPE_BROADCAST;
+    // packet->length = 1;
+    // packet->version = WIRELESS_PACKET_VERSION;
+    // packet->crc = 0;
+    // packet->payload[0] = master_ruling_code;
+    // packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, sizeof(wireless_packet_t) + 1);
 
-    if (esp_now_send(broadcast_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // if (esp_now_send(broadcast_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "Send broadcast packet fail");
+    //     free(packet);
+    //     return false;
+    // }
+    if (esp_now_send(broadcast_mac, (uint8_t *)broadcast_packet, bp_len) != ESP_OK)
     {
         ESP_LOGE(TAG, "Send broadcast packet fail");
-        free(packet);
         return false;
     }
 
     return true;
 }
 
-static bool send_connect_packet(int type, uint8_t connect_code)
+static inline bool send_connect_packet(int type, uint8_t connect_code)
 {
-    size_t p_len = sizeof(wireless_packet_t) + 2;
-    wireless_packet_t *packet = malloc(p_len);
-    if (packet == NULL)
+    // size_t p_len = sizeof(wireless_packet_t) + 2;
+    // wireless_packet_t *packet = malloc(p_len);
+    // if (packet == NULL)
+    // {
+    //     ESP_LOGE(TAG, "Malloc packet fail");
+    //     return false;
+    // }
+    // packet->type = WIRELESS_PACKET_TYPE_CONNECT;
+    // packet->length = 2;
+    // packet->version = WIRELESS_PACKET_VERSION;
+    // packet->crc = 0;
+    // packet->payload[0] = type;
+    // packet->payload[1] = connect_code;
+    // packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
+    // if (esp_now_send(target_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "Send connecting packet fail");
+    //     free(packet);
+    //     return false;
+    // }
+    wireless_packet_t *s_packet = NULL;
+    size_t sp_len = 0;
+    if (type == CON_TYPE_RST)
     {
-        ESP_LOGE(TAG, "Malloc packet fail");
-        return false;
+        s_packet = connect_rst_packet;
+        sp_len = crp_len;
     }
-    packet->type = WIRELESS_PACKET_TYPE_CONNECT;
-    packet->length = 2;
-    packet->version = WIRELESS_PACKET_VERSION;
-    packet->crc = 0;
-    packet->payload[0] = type;
-    packet->payload[1] = connect_code;
-    packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
-    if (esp_now_send(target_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    else if (type == CON_TYPE_ACK)
+    {
+        s_packet = connect_ack_packet;
+        sp_len = cap_len;
+    }
+    else
+    {
+        s_packet = connect_establish_packet;
+        sp_len = cep_len;
+    }
+    s_packet->payload[1] = connect_code;
+    s_packet->crc = 0;
+    s_packet->crc = crc16_le(UINT16_MAX, (uint8_t *)s_packet, sp_len);
+    if (esp_now_send(target_mac, (uint8_t *)s_packet, sp_len) != ESP_OK)
     {
         ESP_LOGE(TAG, "Send connecting packet fail");
-        free(packet);
         return false;
     }
     return true;
 }
 
-static bool send_heartbeat_packet(int type)
+static inline bool send_heartbeat_packet(int type)
 {
-    size_t p_len = sizeof(wireless_packet_t);
-    wireless_packet_t *packet = malloc(p_len);
-    if (packet == NULL)
-    {
-        ESP_LOGE(TAG, "Malloc packet fail");
-        return false;
-    }
-    packet->type = type == 1 ? WIRELESS_PACKET_TYPE_DATA : WIRELESS_PACKET_TYPE_DATA_ACK;
-    packet->length = 0;
-    packet->version = WIRELESS_PACKET_VERSION;
-    packet->crc = 0;
-    packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
-    if (esp_now_send(target_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // size_t p_len = sizeof(wireless_packet_t);
+    // wireless_packet_t *packet = malloc(p_len);
+    // if (packet == NULL)
+    // {
+    //     ESP_LOGE(TAG, "Malloc packet fail");
+    //     return false;
+    // }
+    // packet->type = type == 1 ? WIRELESS_PACKET_TYPE_DATA : WIRELESS_PACKET_TYPE_DATA_ACK;
+    // packet->length = 0;
+    // packet->version = WIRELESS_PACKET_VERSION;
+    // packet->crc = 0;
+    // packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
+    // if (esp_now_send(target_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "Send heartbeat packet fail");
+    //     free(packet);
+    //     return false;
+    // }
+    if (esp_now_send(target_mac, (uint8_t *)(type == 1 ? heartbeat_packet : heartbeat_ack_packet), hp_len) != ESP_OK)
     {
         ESP_LOGE(TAG, "Send heartbeat packet fail");
-        free(packet);
         return false;
     }
     return true;
 }
 
-static bool send_ack_packet()
+static inline bool send_ack_packet()
 {
-    size_t p_len = sizeof(wireless_packet_t);
-    wireless_packet_t *packet = malloc(p_len);
-    if (packet == NULL)
-    {
-        ESP_LOGE(TAG, "Malloc packet fail");
-        return false;
-    }
-    packet->type = WIRELESS_PACKET_TYPE_DATA_ACK;
-    packet->length = 0;
-    packet->version = WIRELESS_PACKET_VERSION;
-    packet->crc = 0;
-    packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
-    if (esp_now_send(target_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // size_t p_len = sizeof(wireless_packet_t);
+    // wireless_packet_t *packet = malloc(p_len);
+    // if (packet == NULL)
+    // {
+    //     ESP_LOGE(TAG, "Malloc packet fail");
+    //     return false;
+    // }
+    // packet->type = WIRELESS_PACKET_TYPE_DATA_ACK;
+    // packet->length = 0;
+    // packet->version = WIRELESS_PACKET_VERSION;
+    // packet->crc = 0;
+    // packet->crc = crc16_le(UINT16_MAX, (uint8_t const *)packet, p_len);
+    // if (esp_now_send(target_mac, (uint8_t *)packet, p_len) != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "Send ack packet fail");
+    //     free(packet);
+    //     return false;
+    // }
+
+    if (esp_now_send(target_mac, (uint8_t *)data_ack_packet, dap_len) != ESP_OK)
     {
         ESP_LOGE(TAG, "Send ack packet fail");
-        free(packet);
         return false;
     }
     return true;
@@ -273,7 +414,7 @@ void wireless_add_peer(const uint8_t *mac_addr, bool encrypt)
     }
 }
 
-inline bool wireless_packet_check(wireless_packet_t *packet)
+static inline bool wireless_packet_check(wireless_packet_t *packet)
 {
     // 检查数据包长度
     if (packet == NULL) // ||packet->length > WIRELESS_PACKET_MAX_PAYLOAD_SIZE)
@@ -302,13 +443,13 @@ void wireless_con_manager_task(void *pvParameters)
     uint32_t last_broadcast_time = 0;
     uint32_t last_connect_rst_time = 0;
     uint8_t connect_code = 0;
-    espnow_event_t evt;
+    espnow_event_t evt = {0};
     esp_timer_start_periodic(heartbeat_timer, 1000 * 10); // 设置心跳间隔为配置的心跳间隔
     while (1)
     {
         if (status == WIRELESS_STATUS_CONNECTED)
         {
-            if (heartbeat_time > (CONFIG_HEARTBEAT_INTERVAL + 3000))
+            if (heartbeat_time > (CONFIG_HEARTBEAT_INTERVAL + 1000))
             {
                 // 心跳超时, 连接断开
                 printf("心跳超时, 连接断开\n");
@@ -321,6 +462,12 @@ void wireless_con_manager_task(void *pvParameters)
         {
             // TODO 清理数据，再次广播
             printf("设备掉线\n");
+            // 删除对端设备
+            if(!IS_BROADCAST_ADDR(target_mac))
+            {
+                esp_now_del_peer(target_mac);
+                memcpy(target_mac, broadcast_mac, ESP_NOW_ETH_ALEN);
+            }
             retry_count = 0;
             is_master = false;
             status = WIRELESS_STATUS_BROADCAST;
@@ -337,40 +484,41 @@ void wireless_con_manager_task(void *pvParameters)
         }
         else if (status == WIRELESS_STATUS_CONNECT_RST)
         {
-            if (xTaskGetTickCount() - last_connect_rst_time < pdMS_TO_TICKS(CONFIG_CONNECT_INTERVAL))
+            if (xTaskGetTickCount() - last_connect_rst_time >= pdMS_TO_TICKS(CONFIG_CONNECT_INTERVAL))
             {
-                continue;
+                if (retry_count >= 3)
+                {
+                    // 连接失败, 继续广播
+                    status = WIRELESS_STATUS_BROADCAST;
+                    retry_count = 0;
+                    is_master = false;
+                }
+                connect_code = esp_random() & 0xff;
+                send_connect_packet(1, connect_code);
+                retry_count++;
+                last_connect_rst_time = xTaskGetTickCount();
             }
-            if (retry_count >= 3)
-            {
-                // 连接失败, 继续广播
-                status = WIRELESS_STATUS_BROADCAST;
-                retry_count = 0;
-                is_master = false;
-            }
-            connect_code = esp_random() & 0xff;
-            send_connect_packet(1, connect_code);
-            last_connect_rst_time = xTaskGetTickCount();
-            retry_count++;
         }
 
-        // 回调处理
+        // ? 收到数据包时这个循环会变得很慢
+        // TODO
+        /* TODO
+            主机回调数据队列被填满的可能原因：
+            1. 循环太慢，对端广播发送太快，处理不过来
+            2. 处理任务的优先级太低
+            3. 。。。
+        */
         if (xQueueReceive(espnow_cb_queue, &evt, pdMS_TO_TICKS(1)) == pdTRUE)
         {
             // 收到数据包
             if (evt.id == ESPNOW_RECV_CB)
             {
-                // 有效检测
                 wireless_packet_t *packet = (wireless_packet_t *)evt.info.recv_cb.data;
+                // 有效检测
                 if (!wireless_packet_check(packet))
                 {
                     ESP_LOGE(TAG, "Invalid packet received");
-                    free(packet);
-                    continue;
-                }
-                if (status != WIRELESS_STATUS_CONNECTED && !(packet->type == WIRELESS_PACKET_TYPE_BROADCAST || packet->type == WIRELESS_PACKET_TYPE_CONNECT))
-                {
-                    ESP_LOGD(TAG, "未连接状态下收到非广播包，丢弃数据包");
+                    free_p(packet);
                     continue;
                 }
                 // 数据包分类处理
@@ -380,6 +528,11 @@ void wireless_con_manager_task(void *pvParameters)
                 case WIRELESS_PACKET_TYPE_BROADCAST:
                     if (status != WIRELESS_STATUS_BROADCAST)
                     {
+                        if(memcmp(evt.info.recv_cb.mac_addr, target_mac, ESP_NOW_ETH_ALEN) == 0)
+                        {
+                            // 对端进入广播状态，判定对方掉线重新连接
+                            status = WIRELESS_STATUS_DISCONNECTED;
+                        }
                         break;
                     }
                     if (master_ruling_code > packet->payload[0])
@@ -393,19 +546,19 @@ void wireless_con_manager_task(void *pvParameters)
                     break;
                 // 连接包, 用于连接建立，只在广播状态下处理
                 case WIRELESS_PACKET_TYPE_CONNECT:
-                    if (status != WIRELESS_STATUS_BROADCAST)
+                    if (status != WIRELESS_STATUS_BROADCAST && status != WIRELESS_STATUS_CONNECT_RST)
                     {
                         break;
                     }
-                    wireless_add_peer(evt.info.recv_cb.mac_addr, false);
                     // 判断是请求包还是应答包
-                    if (packet->payload[0] == 0x01) // 请求包
+                    if (packet->payload[0] == CON_TYPE_RST) // 请求包
                     {
+                        wireless_add_peer(evt.info.recv_cb.mac_addr, false);
                         connect_code = packet->payload[1];
                         send_connect_packet(2, connect_code + 1);
                         ESP_LOGD(TAG, "收到连接请求包，返回连接码: %d", connect_code);
                     }
-                    else if (packet->payload[0] == 0x02) // 应答包
+                    else if (packet->payload[0] == CON_TYPE_ACK) // 应答包
                     {
                         // 验证连接校验码
                         ESP_LOGD(TAG, "收到连接请求应答包，连接码: %d", packet->payload[1]);
@@ -429,7 +582,7 @@ void wireless_con_manager_task(void *pvParameters)
                             status = WIRELESS_STATUS_BROADCAST;
                         }
                     }
-                    else if (packet->payload[0] == 0x03) // 连接建立包
+                    else if (packet->payload[0] == CON_TYPE_EST) // 连接建立包
                     {
                         ESP_LOGD(TAG, "收到连接建立包，连接码: %d", packet->payload[1]);
                         if (packet->payload[1] == connect_code + 2)
@@ -465,7 +618,7 @@ void wireless_con_manager_task(void *pvParameters)
                     {
                         // 如果数据包长度为0，是心跳包，回复应答
                         send_heartbeat_packet(2);
-                        break; 
+                        break;
                     }
                     buf_len_t espnow_serial = {
                         .len = packet->length,
@@ -495,11 +648,7 @@ void wireless_con_manager_task(void *pvParameters)
                     break;
                 }
                 // 释放数据包内存，此内存在espnow_recv_cb中分配
-                if (packet != NULL)
-                {
-                    free(packet);
-                    packet = NULL;
-                }
+                free_p(packet);
             }
         }
     }
@@ -604,7 +753,6 @@ void wireless_heartbeat_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-
 void wifi_init(void)
 {
     static bool initialized = false;
@@ -634,7 +782,7 @@ esp_err_t Serial_Espnow_init(void)
         ESP_LOGE(TAG, "Create queue fail");
         return ESP_FAIL;
     }
-
+    create_packet();
     // 初始化ESP_NOW
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));

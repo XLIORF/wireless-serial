@@ -8,11 +8,9 @@
 #define ESPNOW_WIFI_IF ESP_IF_WIFI_AP
 #endif
 
-#define ESPNOW_CB_QUEUE_SIZE 12
-#define ESPNOW_SEND_QUEUE_SIZE 12
-#define ESPNOW_SEND_PRORITY_QUEUE_SIZE 2
+#define ESPNOW_CB_QUEUE_SIZE 8
 #define WIRELESS_RECV_QUEUE_SIZE 12
-#define IS_BROADCAST_ADDR(addr) (memcmp(addr, example_broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
+#define IS_BROADCAST_ADDR(addr) (memcmp(addr, broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
 
 #define BUF_SIZE (1024)
 #define RX_BUF_SIZE (32)
