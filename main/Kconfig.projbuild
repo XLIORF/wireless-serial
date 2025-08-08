@@ -1,4 +1,4 @@
-menu "Example Configuration"
+menu "无线串口配置"
 
 choice WIFI_MODE
     prompt "WiFi mode"
@@ -56,6 +56,8 @@ config CONNECT_INTERVAL
     int "连接包发送间隔(ms)"
     range 100 3000
     default 1000
+    help    
+        两个连接包之间的间隔，在较差的电磁环境中，此值不应该过小，避免连接包不匹配导致连接失败
 
 
 config BROADCAST_INTERVAL
@@ -68,15 +70,30 @@ config HEARTBEAT_INTERVAL
     int "心跳包发送间隔(ms)"
     range 1000 10000
     default 3000
+    help
+        心跳包的发送间隔，心跳断开检查会比此值多一秒
 
 
 config WLCON_MANAGER_PRORITY
     int "无线连接管理进程优先级"
     range 1 16
     default 6
+    help
+        管理无线发现，连接，心跳，数据发送的任务
 
-config PRORITY_ESPNOW_SNED
-    int "ESPNOW发包任务的优先级"
-    range 1 16
-    default 5
+config UART_BUF_SIZE
+    int "串口缓冲区的大小"
+    default 1024
+
+config WLCON_IO_QUEUE_SIZE
+    int "无线IO队列长度"
+    default 8
+    help
+        串口与无线传输函数之间的队列长度
+
+config CONNECT_RETRY
+    int "连接重试次数"
+    default 3
+    help
+        发起连接尝试的次数，超过此次数后再次广播
 endmenu

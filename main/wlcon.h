@@ -9,13 +9,14 @@
 #endif
 
 #define ESPNOW_CB_QUEUE_SIZE 8
-#define WIRELESS_RECV_QUEUE_SIZE 12
+#define WIRELESS_PACKET_VERSION 1U
 #define IS_BROADCAST_ADDR(addr) (memcmp(addr, broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
 
-#define BUF_SIZE (1024)
-#define RX_BUF_SIZE (32)
-#define EX_UART_NUM UART_NUM_0
 #include "esp_system.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 // 无线通信状态
 typedef enum
 {
@@ -50,14 +51,8 @@ typedef struct
 typedef struct
 {
     uint16_t len;
-    uint8_t *data; // 必须可以被free正确释放
-    uint8_t *mac;
-} __attribute__((packed)) espnow_packet_t;
-
-typedef struct
-{
-    uint16_t len;
-    uint8_t *data; // 必须可以被free正确释放
+    uint8_t *buf; // 必须可以被free正确释放
+    uint8_t flag; // BIT0表示是否需要释放buf
 } __attribute__((packed)) buf_len_t;
 
 typedef enum
@@ -92,6 +87,7 @@ typedef struct
 } espnow_event_t;
 
 void wifi_init(void);
-esp_err_t Serial_Espnow_init(void);
-void uart_rx_task(void *);
+esp_err_t wlcon_init(void);
+void wlcon_io_register(xQueueHandle send, xQueueHandle recv);
+bool wlcon_is_connected();
 #endif

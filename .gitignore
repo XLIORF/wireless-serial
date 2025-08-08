@@ -8,3 +8,5 @@ sdkconfig.old
 .vscode/settings.json
 sdkconfig.old
 .vscode/settings.json
+sdkconfig
+sdkconfig.*
